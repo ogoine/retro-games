@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Doxxa Blast</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
+        body { margin: 0; background: #0a0a0a; overflow: hidden; display: flex; justify-content: center; align-items: center; height: 100vh; font-family: 'Press Start 2P', cursive; color: #fff; }
+        canvas { border: 4px solid #333; box-shadow: 0 0 30px rgba(0, 255, 255, 0.2); }
+    </style>
+</head>
+<body>
+    <canvas id="gameCanvas"></canvas>
+
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+// --- CONSTANTS: ENGINE & DISPLAY ---
+const CANVAS_W = 1024;
+const CANVAS_H = 768;
+const PLAY_W = 700; 
+const PLAY_H = 650; 
+const BULLET_SPEED = 10;
+const HP_COLORS = ['#ffffff', '#ffff00', '#ff00ff', '#00ffff', '#ff4400', '#00ff00'];
+
+// --- CONSTANTS: PLAYER MECHANICS ---
+const PADDLE_MAX_SPEED = 6; 
+const ACCEL = 1.0;          
+const FRICTION = 0.85;
+const PLAYER_SKILL_CAP = 200;
+const MAX_SPREAD_ANGLE = 35 * (Math.PI / 180); 
+const BASE_FIRE_RATE = 170
+const BOOST_FIRE_RATIO = 0.4
+
+// --- CONSTANTS: POWER SYSTEM ---
+const POWER_MIN = 1;
+const POWER_MAX = 350;
+const POWER_DRAIN = 0.017;
+const POWER_CHARGE_BASE = 0.06;
+const MAX_CHARGE_TIME = 2;
+const CHARGE_SPRING = 3;
+const CHARGE_DECAY = 4;
+const CHARGE_LEVEL_BONUS = 0.001;
+const CHARGE_UNSPRING = 0.3;
+
+// --- CONSTANTS: ABILITIES ---
+const COST_BOOST = 150;
+const COST_SKILL_UP = 100;
+const COST_NEGATOR = 50;
+const BOOST_DURATION = 6000;
+const NEGATOR_DURATION = 2500;
+const NEGATOR_POWER_BONUS = 0.5
+const SKILL_UP_AMT = 4;
+
+// --- CONSTANTS: ALIEN & WAVE BALANCING ---
+const INITIAL_ALIEN_SPEED = 0.25;
+const INITIAL_WAVE_SIZE = 15;
+const SPEED_INCREMENT = 0.03; 
+const ALIEN_SIZE = 20;
+const ALIEN_SPACING = 10;
+const ALIEN_COLS = 21; 
+const ROW_GAP = 40;    
+const CYCLE_STEPS = 5;  
+const SIDE_PADDING = 10; 
+const MAX_ALIEN_HP = 6;
+
+// -- CONSTANTS: SPECIAL ITEMS ---
+const BOMB_RARITY = 0.1;
+const BOMB_RADIUS = 100;
+
+// --- CONSTANTS: PARASITE MECHANICS ---
+const PARASITE_SKILL_PENALTY = 1;
+const PARASITE_POWER_PENALTY = 5;
+const PARASITE_ENERGY_PENALTY = 5;
+const PARASITE_CHANCE_MULT = 8; // divisor in (rows/100 * count) / mult
+
+canvas.width = CANVAS_W;
+canvas.height = CANVAS_H;
+
+let player, aliens, bullets, lastShotTime, keys, currentRowCount;
+let explosions = [];
+let currentWave, currentLevel, currentAlienSpeed, spawnedRowsInWave, gameOver;
+let energy, power, rowsDefeatedCount;
+let parasites = [];
+let parasiteDamageTotal = 0;
+let chargeTimer = 0;
+let boostActive, boostEndTime, negatorActive, negatorEndTime;
+
+function spawnRow(yPos) {
+    // Parasite Logic
+    let totalParasitePower = 0;
+    
+    parasites.forEach(p => {
+        let rowsLived = currentRowCount - p.spawnedAtRow;
+        // Cap at 100 rows, power scales 0 to 1
+        let pPower = Math.min(100, rowsLived); 
+        totalParasitePower += pPower;
+
+        // Damage Logic: Use the individual parasite's power for the roll
+        let chance = (pPower / 100) / PARASITE_CHANCE_MULT;
+        if (Math.random() < chance) {
+            currentLevel = Math.max(1, currentLevel - PARASITE_SKILL_PENALTY);
+            power = Math.max(POWER_MIN, power - PARASITE_POWER_PENALTY);
+            energy = Math.max(0, energy - PARASITE_ENERGY_PENALTY);
+            parasiteDamageTotal++; // Increment damage counter
+        }
+    });
+
+    const blockWidth = (ALIEN_COLS * ALIEN_SIZE) + ((ALIEN_COLS - 1) * ALIEN_SPACING);
+    const availableSpace = PLAY_W - (SIDE_PADDING * 2) - blockWidth;
+    
+    const mod = (CYCLE_STEPS - 1) * 2;
+    const currentStep = currentRowCount % mod;
+    const zigzagIndex = currentStep < CYCLE_STEPS ? currentStep : mod - currentStep;
+    const horizontalOffset = SIDE_PADDING + (availableSpace / (CYCLE_STEPS - 1)) * zigzagIndex;
+    
+    const currentWaveGoal = INITIAL_WAVE_SIZE + (currentWave - 1);
+    if (spawnedRowsInWave >= currentWaveGoal) {
+        currentWave++;
+        currentAlienSpeed += SPEED_INCREMENT;
+        spawnedRowsInWave = 0;
+    }
+
+    // Alien HP scaling: Increase every 4 waves, max 5.
+    let startingHP = Math.min(MAX_ALIEN_HP, 2 + Math.floor((currentWave - 1) / 4));
+
+    // Determine if this row contains a bomb
+    const hasBomb = Math.random() < BOMB_RARITY;
+    const bombIndex = hasBomb ? Math.floor(Math.random() * ALIEN_COLS) : -1;
+
+    for (let j = 0; j < ALIEN_COLS; j++) {
+        aliens.push({
+            x: j * (ALIEN_SIZE + ALIEN_SPACING) + horizontalOffset,
+            y: yPos,
+            w: ALIEN_SIZE,
+            h: ALIEN_SIZE,
+            hp: startingHP,
+            maxHp: startingHP,
+            isBomb: j === bombIndex
+        });
+    }
+    currentRowCount++;
+    spawnedRowsInWave++;
+}
+
+function createExplosion(x, y) {
+    // Animation object
+    explosions.push({ x, y, r: 5, maxR: BOMB_RADIUS, opacity: 1 });
+
+    // Destruction Logic
+    for (let i = aliens.length - 1; i >= 0; i--) {
+        let a = aliens[i];
+        let dx = (a.x + a.w / 2) - x;
+        let dy = (a.y + a.h / 2) - y;
+        let dist = Math.sqrt(dx * dx + dy * dy);
+
+        if (dist <= BOMB_RADIUS) {
+            energy++;
+            if (negatorActive) power = Math.min(POWER_MAX, power + NEGATOR_POWER_BONUS);
+
+            const rowY = a.y;
+            aliens.splice(i, 1);
+            if (!aliens.some(al => Math.abs(al.y - rowY) < 5)) rowsDefeatedCount++;
+        }
+    }
+}
+
+function init() {
+    player = { x: PLAY_W / 2 - 20, y: PLAY_H - 40, vx: 0, w: 40, h: 12 };
+    aliens = [];
+    bullets = [];
+    lastShotTime = 0;
+    keys = {};
+    currentRowCount = 0; 
+    currentWave = 1;
+    currentLevel = 1;
+    currentAlienSpeed = INITIAL_ALIEN_SPEED;
+    spawnedRowsInWave = 0;
+    gameOver = false;
+    energy = 0;
+    power = 50;
+    rowsDefeatedCount = 0;
+    parasites = [];
+    parasiteDamageTotal = 0;
+    boostActive = false;
+    negatorActive = false;
+    boostEndTime = 0;
+    negatorEndTime = 0;
+    explosions = [];
+    spawnRow(40);
+}
+
+window.addEventListener('keydown', e => {
+    keys[e.code] = true;
+    if (gameOver && e.code === 'Enter') init();
+    
+    if (e.code === 'KeyB' && energy >= COST_BOOST && !boostActive) {
+        boostActive = true;
+        boostEndTime = Date.now() + BOOST_DURATION;
+        energy -= COST_BOOST;
+    }
+    if (e.code === 'KeyV' && energy >= COST_SKILL_UP && currentLevel < PLAYER_SKILL_CAP) {
+        currentLevel = Math.min(PLAYER_SKILL_CAP, currentLevel + SKILL_UP_AMT);
+        energy -= COST_SKILL_UP;
+    }
+    if (e.code === 'KeyN' && energy >= COST_NEGATOR && !negatorActive) {
+        negatorActive = true;
+        negatorEndTime = Date.now() + NEGATOR_DURATION;
+        
+        // Track the birth of the parasite
+        parasites.push({ spawnedAtRow: currentRowCount }); 
+        
+        energy -= COST_NEGATOR;
+    }
+});
+window.addEventListener('keyup', e => keys[e.code] = false);
+
+function update() {
+    if (gameOver) return;
+
+    // Movement & Physics
+    if (keys['ArrowLeft']) player.vx -= ACCEL;
+    else if (keys['ArrowRight']) player.vx += ACCEL;
+    else player.vx *= FRICTION;
+
+    player.vx = Math.max(-PADDLE_MAX_SPEED, Math.min(PADDLE_MAX_SPEED, player.vx));
+    player.x += player.vx;
+    player.x = Math.max(0, Math.min(PLAY_W - player.w, player.x));
+
+    // Timers
+    if (boostActive && Date.now() > boostEndTime) boostActive = false;
+    if (negatorActive && Date.now() > negatorEndTime) negatorActive = false;
+
+    // Power Resource Logic
+    const dt = 1/60; // Seconds per frame (assuming 60fps loop)
+    if (keys['Space']) {
+        chargeTimer = Math.min(MAX_CHARGE_TIME, chargeTimer + dt);
+        
+        const t = Math.max(1, chargeTimer);
+        const springMult = 1 + CHARGE_SPRING / (t ** CHARGE_DECAY);
+        
+        const bonusFromLevel = CHARGE_LEVEL_BONUS * currentLevel;
+        const chargeEfficiency = 1 - (power / (POWER_MAX + 50)); 
+        
+        power = Math.min(POWER_MAX, power + (POWER_CHARGE_BASE + bonusFromLevel) * chargeEfficiency * springMult);
+    } else {
+        chargeTimer = Math.max(0, chargeTimer - dt * CHARGE_UNSPRING);
+        power = Math.max(POWER_MIN, power - POWER_DRAIN);
+    }
+
+    // Firing Mechanics
+    let normalFireRate = BASE_FIRE_RATE - (currentLevel / 2);
+    let boostFireRate = normalFireRate * BOOST_FIRE_RATIO;
+    let now = Date.now();
+    let currentInterval = boostActive ? boostFireRate : normalFireRate;
+    
+    let bulletsToSpawn = keys['Space'] ? 2 : (power > 300 ? 6 : power > 200 ? 5 : power > 100 ? 4 : 3);
+
+    if (now - lastShotTime > currentInterval) {
+        const startX = player.x + player.w / 2;
+        const startY = player.y - 8; 
+        const angleStep = MAX_SPREAD_ANGLE / (bulletsToSpawn + 1);
+        
+        for (let i = 1; i <= bulletsToSpawn; i++) {
+            const absAngle = -Math.PI / 2 + (i * angleStep) - (MAX_SPREAD_ANGLE / 2);
+            bullets.push({ 
+                x: startX - 2, y: startY,
+                vx: Math.cos(absAngle) * BULLET_SPEED,
+                vy: Math.sin(absAngle) * BULLET_SPEED,
+                isFiery: boostActive
+            });
+        }
+        lastShotTime = now;
+    }
+
+    // Bullet Movement
+    for (let i = bullets.length - 1; i >= 0; i--) {
+        let b = bullets[i];
+        b.x += b.vx; b.y += b.vy;
+        if (b.y < 0 || b.x < 0 || b.x > PLAY_W) bullets.splice(i, 1);
+    }
+
+    // Update Explosions
+    for (let i = explosions.length - 1; i >= 0; i--) {
+        let ex = explosions[i];
+        ex.r += 8; // Expansion speed
+        ex.opacity -= 0.05;
+        if (ex.opacity <= 0) explosions.splice(i, 1);
+    }
+
+    // Alien Movement (With Bomb Exception for Game Over)
+    for (let i = aliens.length - 1; i >= 0; i--) {
+        let a = aliens[i];
+        a.y += currentAlienSpeed;
+        if (a.y + a.h > PLAY_H) {
+            if (a.isBomb) {
+                aliens.splice(i, 1); // Bombs just despawn at the bottom
+            } else {
+                gameOver = true;
+            }
+        }
+    }
+
+    // Find the highest alien to determine when to spawn the next row
+    let highestY = PLAY_H;
+    if (aliens.length > 0) {
+        highestY = Math.min(...aliens.map(a => a.y));
+    }
+
+    // Spawn new aliens
+    if (highestY > ROW_GAP + 20) spawnRow(highestY - ROW_GAP);
+
+    // --- SPATIAL PARTITIONING COLLISION ENGINE ---
+    const grid = {};
+    const cellSize = 50; 
+    aliens.forEach(a => {
+        const col = Math.floor(a.x / cellSize);
+        if (!grid[col]) grid[col] = [];
+        grid[col].push(a);
+    });
+
+    for (let bIdx = bullets.length - 1; bIdx >= 0; bIdx--) {
+        let b = bullets[bIdx];
+        const bCol = Math.floor(b.x / cellSize);
+        const targets = (grid[bCol] || []).concat(grid[bCol-1] || [], grid[bCol+1] || []);
+
+        for (let a of targets) {
+            if (b.x < a.x + a.w && b.x + 4 > a.x && b.y < a.y + a.h && b.y + 4 > a.y) {
+                bullets.splice(bIdx, 1);
+                
+                if (a.isBomb) {
+                    createExplosion(a.x + a.w / 2, a.y + a.h / 2);
+                    const idx = aliens.indexOf(a);
+                    if (idx > -1) aliens.splice(idx, 1);
+                } else {
+                    if (negatorActive) {
+                        a.hp = 0; 
+                        power = Math.min(POWER_MAX, power + NEGATOR_POWER_BONUS);
+                    } else {
+                        a.hp--;
+                    }
+
+                    if (a.hp <= 0) {
+                        energy++;
+                        const rowY = a.y;
+                        const actualIdx = aliens.indexOf(a);
+                        if (actualIdx > -1) aliens.splice(actualIdx, 1);
+                        if (!aliens.some(al => Math.abs(al.y - rowY) < 5)) rowsDefeatedCount++;
+                    }
+                }
+                break; 
+            }
+        }
+    }
+}
+
+function getPowerColor() {
+    if (keys['Space']) return (Math.floor(Date.now() / 80) % 2 === 0) ? '#ff00ff' : '#ffaa00';
+    if (power > 300) return '#ff0000';
+    if (power > 200) return '#ff8800';
+    if (power > 100) return '#ffff00';
+    return '#00ffff';
+}
+
+function draw() {
+    ctx.fillStyle = '#050505';
+    ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+    const marginX = (CANVAS_W - PLAY_W) / 2;
+    const marginY = 80;
+
+    ctx.fillStyle = '#111';
+    ctx.fillRect(10, marginY, marginX - 20, PLAY_H);
+    ctx.fillRect(CANVAS_W - marginX + 10, marginY, marginX - 20, PLAY_H);
+
+    // Title
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ff00ff';
+    ctx.font = '40px "Press Start 2P"';
+    ctx.fillText('DOXXA BLAST', CANVAS_W/2, 60);
+    ctx.shadowBlur = 10;
+    ctx.shadowColor = '#0ff';
+    ctx.strokeStyle = '#0ff';
+    ctx.lineWidth = 2;
+    ctx.strokeText('DOXXA BLAST', CANVAS_W/2, 60);
+    ctx.shadowBlur = 0;
+    
+    const labelSize = '12px "Press Start 2P"';
+    const subLabelSize = '8px "Press Start 2P"';
+
+    // UI Top Left
+    ctx.textAlign = 'left';
+    ctx.font = labelSize;
+    ctx.fillStyle = '#0ff';
+    ctx.fillText('GUIDE', 25, marginY + 40); // Matches "STATUS" height
+
+    ctx.font = '7px "Press Start 2P"';
+    ctx.fillStyle = '#fff';
+    const guideY = marginY + 70;
+    const lines = [
+        "CHARGE POWER TO",
+        "INCREASE VOLLEY",
+        "",
+        "LVL UP TO FIRE",
+        "& CHARGE FASTER",
+        "",
+        "BOOST AS NEEDED",
+        "",
+        "NEGATOR ATTRACTS",
+        "PARASITES THAT",
+        "SAP YOUR LVL",
+        "& POWER"
+    ];
+
+    lines.forEach((line, i) => {
+        ctx.fillText(line, 25, guideY + (i * 12));
+    });
+
+    // UI Bottom Left
+    ctx.textAlign = 'left';
+    ctx.font = labelSize;
+    ctx.fillStyle = '#0ff';
+    ctx.fillText('ENERGY', 25, marginY + PLAY_H - 40);
+    ctx.fillStyle = '#fff';
+    ctx.fillText(`${energy}`, 25, marginY + PLAY_H - 10);
+
+    const menuY = marginY + PLAY_H - 80;
+    const abilities = [
+        { name: '[B] BOOST', cost: COST_BOOST, active: boostActive, disabled: false },
+        { name: '[V] LVL UP', cost: COST_SKILL_UP, active: false, disabled: currentLevel >= PLAYER_SKILL_CAP },
+        { name: '[N] NEGATOR', cost: COST_NEGATOR, active: negatorActive, disabled: false }
+    ];
+
+    abilities.forEach((ab, i) => {
+        let isAvailable = energy >= ab.cost && !ab.disabled;
+        if (ab.active) ctx.fillStyle = '#0f0';
+        else if (ab.disabled) ctx.fillStyle = '#f00';
+        else if (isAvailable) ctx.fillStyle = '#fff';
+        else ctx.fillStyle = '#666';
+        
+        ctx.font = subLabelSize;
+        let displayName = ab.disabled ? 'MAX LVL' : `${ab.name} (${ab.cost})`;
+        ctx.fillText(displayName, 25, menuY - (i * 25));
+    });
+
+    // UI Top Right
+    ctx.textAlign = 'left';
+    ctx.font = labelSize;
+    ctx.fillStyle = '#0ff';
+    ctx.fillText('STATUS', CANVAS_W - marginX + 25, marginY + 40);
+
+    ctx.font = subLabelSize;
+    ctx.fillStyle = '#fff';
+    ctx.fillText(`RANK : ${rowsDefeatedCount}`, CANVAS_W - marginX + 25, marginY + 70);
+    ctx.fillText(`LVL: ${currentLevel}`, CANVAS_W - marginX + 25, marginY + 95);
+
+    let totalPwr = parasites.reduce((sum, p) => sum + Math.min(100, currentRowCount - p.spawnedAtRow), 0);
+    ctx.fillStyle = totalPwr > 0 ? '#ff00ff' : '#fff';
+    ctx.fillText(`PARASITES: ${parasites.length}`, CANVAS_W - marginX + 25, marginY + 120);
+    ctx.fillText(`PARA-LVL: ${totalPwr}`, CANVAS_W - marginX + 25, marginY + 145);
+    ctx.fillText(`PARA-DMG: ${parasiteDamageTotal}`, CANVAS_W - marginX + 25, marginY + 170);
+
+    // UI Bottom Right
+    const barX = CANVAS_W - marginX + 25;
+    const barY = marginY + PLAY_H - 110;
+    const barW = 100;
+    const barH = 6;
+
+    ctx.fillStyle = '#333';
+    ctx.fillRect(barX, barY, barW, barH);
+
+    const fillWidth = barW * (1 - (chargeTimer / MAX_CHARGE_TIME));
+    ctx.fillStyle = chargeTimer < 1 ? '#0f0' : (chargeTimer < 2.5 ? '#ff0' : '#f00');
+    ctx.fillRect(barX, barY, fillWidth, barH);
+
+    ctx.textAlign = 'left';
+    ctx.font = labelSize;
+    ctx.fillStyle = '#0ff';
+    ctx.fillText('POWER', CANVAS_W - marginX + 25, marginY + PLAY_H - 80);
+
+    ctx.fillStyle = getPowerColor();
+    let powerDisplay = `${Math.floor(power)}`;
+    if (keys['Space']) powerDisplay += " ^";
+    ctx.fillText(powerDisplay, CANVAS_W - marginX + 25, marginY + PLAY_H - 50);
+
+    ctx.fillStyle = '#666';
+    ctx.font = subLabelSize;
+    ctx.fillText('CHARGE: SPACE', CANVAS_W - marginX + 25, marginY + PLAY_H - 25);
+
+    let currentRounds = power > 300 ? 6 : power > 200 ? 5 : power > 100 ? 4 : 3;
+    ctx.fillStyle = '#888';
+    ctx.font = '7px "Press Start 2P"';
+    ctx.fillText(`VOLLEY SIZE: ${currentRounds}`, CANVAS_W - marginX + 25, marginY + PLAY_H - 10);
+
+    // Play Area
+    ctx.save();
+    ctx.translate(marginX, marginY);
+    ctx.strokeStyle = negatorActive ? '#0ff' : (boostActive ? '#f44' : '#333');
+    ctx.lineWidth = 4;
+    ctx.strokeRect(0, 0, PLAY_W, PLAY_H);
+    
+    ctx.beginPath();
+    ctx.rect(0, 0, PLAY_W, PLAY_H);
+    ctx.clip();
+
+    ctx.fillStyle = boostActive ? '#f0f' : (negatorActive ? '#0ff' : '#0f0');
+    ctx.fillRect(player.x, player.y, player.w, player.h);
+    ctx.fillRect(player.x + player.w/2 - 4, player.y - 8, 8, 8); 
+
+    // Draw aliens and bombs
+    aliens.forEach(a => {
+        if (a.isBomb) {
+            // Flash effect for bomb
+            const flash = Math.floor(Date.now() / 100) % 2 === 0;
+            ctx.fillStyle = flash ? '#ff0000' : '#ffff00';
+            ctx.beginPath();
+            ctx.arc(a.x + a.w/2, a.y + a.h/2, a.w/2, 0, Math.PI * 2);
+            ctx.fill();
+        } else {
+            const colorIndex = negatorActive ? 0 : Math.min(a.hp - 1, HP_COLORS.length - 1);
+            ctx.fillStyle = negatorActive ? '#fff' : HP_COLORS[colorIndex];
+            ctx.fillRect(a.x, a.y, a.w, a.h);
+        }
+    });
+
+    // Draw Explosions
+    explosions.forEach(ex => {
+        ctx.fillStyle = `rgba(255, 68, 0, ${ex.opacity})`;
+        ctx.beginPath();
+        ctx.arc(ex.x, ex.y, ex.r, 0, Math.PI * 2);
+        ctx.fill();
+    });
+
+    bullets.forEach(b => {
+        ctx.fillStyle = b.isFiery ? '#ff4400' : '#ffff00';
+        ctx.fillRect(b.x, b.y, 4, 4);
+    });
+
+    if (gameOver) {
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.85)';
+        ctx.fillRect(0, 0, PLAY_W, PLAY_H);
+        
+        ctx.textAlign = 'center';
+        ctx.fillStyle = '#ff0000';
+        ctx.font = '24px "Press Start 2P"';
+        ctx.fillText('GAME OVER', PLAY_W / 2, PLAY_H / 2 - 20); // Moved up slightly
+        
+        // --- ADD THESE LINES ---
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '10px "Press Start 2P"';
+        ctx.fillText('PRESS ENTER TO RESTART', PLAY_W / 2, PLAY_H / 2 + 30);
+        // -----------------------
+    }
+    ctx.restore();
+
+    // --- MOVEMENT HINT (Bottom Center) ---
+    // Reset alignment to get centered
+    ctx.textAlign = 'center';
+    ctx.font = '8px "Press Start 2P"';
+    ctx.fillStyle = '#666';
+
+    // Draw using the full Canvas width for true centering
+    ctx.fillText('USE ARROWS TO MOVE', CANVAS_W / 2, CANVAS_H - 15);}
+
+// Normalize to standard FPS
+let lastTime = performance.now();
+let accumulator = 0;
+const deltaTime = 1000 / 60; // 16.66ms per logic update
+
+function mainLoop(currentTime) {
+    // Calculate time elapsed since the last frame
+    const frameTime = currentTime - lastTime;
+    lastTime = currentTime;
+
+    // Add elapsed time to the bucket
+    accumulator += frameTime;
+
+    // While there is enough time in the bucket, run a logic update
+    while (accumulator >= deltaTime) {
+        update();
+        accumulator -= deltaTime;
+    }
+
+    // Render the scene once
+    draw();
+
+    // Request the next frame from the browser
+    requestAnimationFrame(mainLoop);
+}
+
+// Initialize and start the new loop
+init();
+requestAnimationFrame(mainLoop);
+</script>
+</body>
+</html>
